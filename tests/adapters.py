@@ -421,11 +421,15 @@ def run_grpo_train_step(
     rollout_batch_size = len(rollout_responses)
     n_group = rollout_batch_size // group_size # 即n_prompts_per_rollout_batch
     
-    mirco_n_group = n_group // gradient_accumulation_steps
+    # 例如 train_batch_size 为 21， group_size 为 4，gradient_accumulation_steps 为 4
+    # 则 n_group = 21， micro_n_group = 5, remainder = 1,
+    # group_counts = [6, 5, 5, 5]
+    # 意味着第一个 microbatch 取 6 组，第二个 microbatch 取 5 组，...，第八个 microbatch 取 0 组
+    micro_n_group = n_group // gradient_accumulation_steps
     remainder = n_group % gradient_accumulation_steps
 
     # 构建每个 microbatch 应取的组数列表
-    group_counts = [mirco_n_group] * gradient_accumulation_steps
+    group_counts = [micro_n_group] * gradient_accumulation_steps
     for i in range(remainder):
         group_counts[i] += 1
 

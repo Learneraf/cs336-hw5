@@ -5,7 +5,7 @@ os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 import sys
 sys.path.append("../")
 import yaml
-from typing import Literal
+from typing import Callable, Iterable, Iterator, Literal, Generator
 import json
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
@@ -13,8 +13,10 @@ from tests.adapters import run_grpo_train_step
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn, question_only_reward_fn
 from cs336_alignment.vllm_utils import VLLMCompletion, VLLMServer
 import logging
+from tqdm import tqdm
+import random
 
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.ERROR)
 logger = logging.getLogger(__name__)
 
 def load_config(
@@ -24,15 +26,35 @@ def load_config(
         config = yaml.safe_load(f)
     return config
 
-def load_gsm8k_data(
-        data_path: str = Literal["../data/gsm8k/train.jsonl", "../data/gsm8k/test.jsonl"]
+def process_prompt(template: str, question: str) -> str:
+    return template.replace("{question}", question)
+
+def load_gsm8k_template_data(
+    template: str,
+    data_path: str = Literal["../data/gsm8k/train.jsonl", 
+                            "../data/gsm8k/test.jsonl"],
+    shuffle: bool = False,
+    limit: int|None = None
 ) -> tuple[list[str], list[str]]:
     questions, answers = [], []
     with open(data_path, "r") as f:
         for line in f:
             data = json.loads(line)
-            questions.append(data["question"])
-            answers.append(data["answer"])
+            templated_data = process_prompt(template=template, question=data["question"])
+            questions.append(templated_data)
+            answer = data["answer"].rsplit("####", 1)[-1].strip() if "####" in data["answer"] else data["answer"]
+            answers.append(answer)
+
+    if shuffle:
+        combined = list(zip(questions, answers))
+        random.seed(0)
+        random.shuffle(combined)
+        questions, answers = zip(*combined)
+
+    if limit is not None:
+        questions = questions[:limit]
+        answers = answers[:limit]
+
     return questions, answers
 
 def duplicate_data(
@@ -40,22 +62,95 @@ def duplicate_data(
     repeat: int
 ) -> list[str]:
     return [item for item in data for _ in range(repeat)]
+
+
+def inference_with_vllm(
+    server: VLLMServer,
+    prompts: list[str],
+    config: dict,
+    rollout_n: int = 1
+) -> list[VLLMCompletion]:
+    return server.generate_completions(
+        prompts=prompts,
+        sampling_params={
+            "temperature": config["sampling_temperature"],
+            "top_p": config["top_p"],
+            "max_tokens": config["sampling_max_tokens"],
+            "n": rollout_n,
+            "seed": 0,
+            "stop": ["</answer>"] if config["prompt_type"] == "r1_zero" or config["prompt_type"] == "r1_zero_three_shot" else None,
+            "include_stop_str_in_output": True if config["prompt_type"] == "r1_zero" or config["prompt_type"] == "r1_zero_three_shot" else False
+        }
+    )
+
+class dataloader:
+    def __init__(
+        self,
+        prompts: list[str],
+        batch_size: int
+    ):
+        self.prompts = prompts
+        self.batch_size = batch_size
+        self._batch_generator = self._generate_batches()
     
+    def _generate_batches(self) -> Iterator[list[str]]:
+        for i in range(0, len(self.prompts), self.batch_size):
+            yield self.prompts[i:i + self.batch_size]
+    
+    def __call__(self) -> Generator[list[str], None, None]:
+        try:
+            return next(self._batch_generator)
+        except StopIteration:
+            return None
+
+def run_test(
+    server: VLLMServer,
+    questions: list[str],
+    answers: list[str],
+    config: dict,
+    reward_fn: Callable[[list[str], list[str]], dict[str, float]]
+) -> tuple[float, float]:
+    
+    responses = inference_with_vllm(
+        server=server,
+        prompts=questions,
+        config=config,
+        rollout_n=1
+    )
+
+    format_reward, answer_reward = 0.0, 0.0
+    responses_texts = [item.text for item in responses]
+    for response, answer in zip(responses_texts, answers):
+        result_dict: dict[str, float] = reward_fn(response, answer)
+        format_reward += result_dict["format_reward"]
+        answer_reward += result_dict["answer_reward"]
+
+    return format_reward / len(questions), answer_reward / len(questions)
 
 def main():
     config_path = "naive_grpo_configs.yaml"
     config = load_config(config_path)
 
-    raw_train_questions, raw_train_answers = load_gsm8k_data(
+    template_path = "../cs336_alignment/prompts/r1_zero_three_shot_gsm8k.prompt"
+    with open(template_path, "r") as f:
+        template = f.read()
+
+    logger.debug(f"template is {template}")
+
+    raw_train_questions, raw_train_answers = load_gsm8k_template_data(
+        template=template,
         data_path="../data/gsm8k/train.jsonl"
     )
-    raw_test_questions, raw_test_answers = load_gsm8k_data(
-        data_path="../data/gsm8k/test.jsonl"
+    raw_test_questions, raw_test_answers = load_gsm8k_template_data(
+        template=template,
+        data_path="../data/gsm8k/test.jsonl",
+        limit=config["n_val_examples"]
     )
 
     logger.debug(f"type(raw_train_questions) is {type(raw_train_questions)}")
     logger.debug(f"type(raw_train_question[0]) is {type(raw_train_questions[0])}")
 
+    # 复制prompt和ground truth答案以匹配group_size
     duplicated_train_questions = duplicate_data(
         data=raw_train_questions,
         repeat=config["group_size"]
@@ -65,49 +160,56 @@ def main():
         repeat=config["group_size"]
     )
 
-    prompt_type = config["prompt_type"]
     server = VLLMServer(
         model_id=config["model"], 
-        gpu=5, 
+        gpu=config["infer_device"], 
         seed=0,
-        gpu_memory_utilization=0.9
+        gpu_memory_utilization=config["gpu_memory_utilization"]
     )
     server.start()
 
     model = AutoModelForCausalLM.from_pretrained(
         config["model"], 
         dtype=torch.bfloat16
-    ).to(config["device"])
+    ).to(config["train_device"])
+    server.init_weight_sync(policy_device=config["train_device"])
     tokenizer = AutoTokenizer.from_pretrained(config["tokenizer"])
-    n_train_examples = min(len(duplicated_train_questions), config["n_train_examples"])
+    optimizer = torch.optim.AdamW(model.parameters(), lr=float(config["learning_rate"]), betas=(0.9, 0.95), weight_decay=0.0)
 
-    for i in range(0, n_train_examples, config["train_batch_size"]):
+    n_train_examples = min(len(raw_train_questions), config["n_train_examples"])
+    train_dataloader = dataloader(
+        prompts=raw_train_questions,
+        batch_size=config["train_batch_size"] // config["group_size"]
+    )
+    tqdm_bar = tqdm(range(0, n_train_examples * config["group_size"], config["train_batch_size"]), desc="Training Progress", unit="batch")
 
-        rollout_responses: list[VLLMCompletion] = server.generate_completions(
-            prompts=duplicated_train_questions[i: i+config["train_batch_size"]],
-            sampling_params={
-                "temperature": config["sampling_temperature"],
-                "top_p": 1.0,
-                "max_tokens": config["sampling_max_tokens"],
-                "n": 1,
-                "seed": 0,
-                "stop": ["</answer>"] if prompt_type == "r1_zero" else None,
-                "include_stop_str_in_output": True if prompt_type == "r1_zero" else False
-            }
+    for i in tqdm_bar:
+        # 推理
+        
+        ''' 
+        Note that rollout_batch_size and train_batch_size count responses, not prompts. 
+        So rollout_batch_size = train_batch_size = 256 means 32 prompts with 8 rollouts each.
+        '''
+
+        ## 同步模型
+        server.sync_policy_weights(model)
+        rollout_responses: list[VLLMCompletion] = inference_with_vllm(
+            server=server,
+            prompts=train_dataloader(),
+            config=config,
+            rollout_n=config["group_size"]
         )
-        logger.debug(f"type(rollout_response) is {type(rollout_responses)}")
-        logger.debug(f"type(rollout_response[0]) is {type(rollout_responses[0])}")
 
         rollout_responses_texts = [item.text for item in rollout_responses]
 
-
-        loss, metadata = run_grpo_train_step(
+        ## 训练
+        train_loss, train_metadata = run_grpo_train_step(
             model=model,
             tokenizer=tokenizer,
-            optimizer=torch.optim.AdamW(model.parameters(), lr=float(config["learning_rate"]), betas=(0.9, 0.95), weight_decay=0.0),
+            optimizer=optimizer,
             gradient_accumulation_steps=config["gradient_accumulation_steps"],
             max_grad_norm=config["max_grad_norm"],
-            reward_fn=question_only_reward_fn if prompt_type == "r1_zero_three_shot" else r1_zero_reward_fn,
+            reward_fn=r1_zero_reward_fn if config["prompt_type"] == "r1_zero_three_shot" or config["prompt_type"] == "r1_zero" else question_only_reward_fn,
             repeated_prompts=duplicated_train_questions[i:i+config["train_batch_size"]],
             rollout_responses=rollout_responses_texts,
             repeated_ground_truths=duplicated_train_answers[i:i+config["train_batch_size"]],
@@ -117,11 +219,24 @@ def main():
             advantage_normalizer=config["advantage_normalizer"],
             importance_reweighting_method=config["importance_reweighting_method"],
             loss_normalization="sequence",
-            device=config["device"]
+            device=config["train_device"]
         )
 
-        print(f"loss: {loss}")
-        print(f"metadata: \n{(metadata)}")
+        ## 评估
+        if i % config["eval_interval"] == 0:
+            test_format_reward, test_answer_reward = run_test(
+                server=server,
+                questions=raw_test_questions,
+                answers=raw_test_answers,
+                config=config,
+                reward_fn=r1_zero_reward_fn if config["prompt_type"] == "r1_zero_three_shot" or config["prompt_type"] == "r1_zero" else question_only_reward_fn
+            )
+
+            print(f"Step {i}: test_format_reward = {test_format_reward}, test_answer_reward = {test_answer_reward}")
+
+        print(f"loss: {train_loss}")
+        print(f"format_reward: {(train_metadata["format_reward"])}")
+        print(f"total_reward: {(train_metadata["total_reward"])}")
 
     server.stop()
 
