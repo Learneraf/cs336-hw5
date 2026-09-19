@@ -9,7 +9,7 @@ from typing import Callable, Iterable, Iterator, Literal, Generator
 import json
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
-from tests.adapters import run_grpo_train_step
+from cs336_alignment.core.grpo_train_step import grpo_train_step
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn, question_only_reward_fn
 from cs336_alignment.vllm_utils import VLLMCompletion, VLLMServer
 import logging
@@ -131,7 +131,7 @@ def main():
     config_path = "naive_grpo_configs.yaml"
     config = load_config(config_path)
 
-    template_path = "../cs336_alignment/prompts/r1_zero_three_shot_gsm8k.prompt"
+    template_path = "../cs336_alignment/prompts/r1_zero.prompt"
     with open(template_path, "r") as f:
         template = f.read()
 
@@ -168,6 +168,8 @@ def main():
     )
     server.start()
 
+    logger.INFO("Server is successfully started!")
+
     model = AutoModelForCausalLM.from_pretrained(
         config["model"], 
         dtype=torch.bfloat16
@@ -203,7 +205,7 @@ def main():
         rollout_responses_texts = [item.text for item in rollout_responses]
 
         ## 训练
-        train_loss, train_metadata = run_grpo_train_step(
+        train_loss, train_metadata = grpo_train_step(
             model=model,
             tokenizer=tokenizer,
             optimizer=optimizer,
