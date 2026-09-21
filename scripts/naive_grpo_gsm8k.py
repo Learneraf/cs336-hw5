@@ -1,11 +1,11 @@
 import os
 
-from numpy import dtype
+from traitlets import Int
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 import sys
 sys.path.append("../")
 import yaml
-from typing import Callable, Iterable, Iterator, Literal, Generator
+from typing import Callable, Iterator, Literal, Generator
 import json
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
@@ -15,12 +15,35 @@ from cs336_alignment.vllm_utils import VLLMCompletion, VLLMServer
 import logging
 from tqdm import tqdm
 import random
+from torch.utils.tensorboard import SummaryWriter
+from cs336_alignment.utils import get_current_time
 
 logging.basicConfig(level=logging.ERROR)
 logger = logging.getLogger(__name__)
 
+writer = SummaryWriter(log_dir=f"../outputs/naive_grpo_gsm8k/{get_current_time()}", flush_secs=15)
+
+def check_hyperparams(
+    train_batch_size: int,
+    group_size: int,
+    n_train_examples: Int
+) -> None:
+
+    assert train_batch_size % group_size == 0, (
+        f"train_batch_size ({train_batch_size}) % group_size ({group_size}) "
+        f"must equal 0, but got remainder {train_batch_size % group_size}"
+    )
+
+    assert n_train_examples % (train_batch_size // group_size) == 0, (
+        f"n_train_examples ({n_train_examples}) % "
+        f"(train_batch_size // group_size) ({train_batch_size // group_size}) "
+        f"must equal 0, but got remainder "
+        f"{n_train_examples % (train_batch_size // group_size)}"
+    )
+
+
 def load_config(
-        config_path: str = "naive_grpo_configs.yaml"
+    config_path: str = "naive_grpo_configs.yaml"
 ):
     with open(config_path, "r") as f:
         config = yaml.safe_load(f)
@@ -131,6 +154,8 @@ def main():
     config_path = "naive_grpo_configs.yaml"
     config = load_config(config_path)
 
+    check_hyperparams(config["train_batch_size"], config["group_size"], config["n_train_examples"])
+
     template_path = "../cs336_alignment/prompts/r1_zero.prompt"
     with open(template_path, "r") as f:
         template = f.read()
@@ -168,7 +193,7 @@ def main():
     )
     server.start()
 
-    logger.INFO("Server is successfully started!")
+    logger.info("Server is successfully started!")
 
     model = AutoModelForCausalLM.from_pretrained(
         config["model"], 
@@ -179,11 +204,13 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(config["learning_rate"]), betas=(0.9, 0.95), weight_decay=0.0)
 
     n_train_examples = min(len(raw_train_questions), config["n_train_examples"])
+    check_hyperparams(config["train_batch_size"], config["group_size"], n_train_examples)
     train_dataloader = dataloader(
         prompts=raw_train_questions,
         batch_size=config["train_batch_size"] // config["group_size"]
     )
     tqdm_bar = tqdm(range(0, n_train_examples * config["group_size"], config["train_batch_size"]), desc="Training Progress", unit="batch")
+    step = 0
 
     for i in tqdm_bar:
         # 推理
@@ -224,8 +251,14 @@ def main():
             device=config["train_device"]
         )
 
+        step += 1
+
         ## 评估
-        if i % config["eval_interval"] == 0:
+        if step % config["eval_interval"] == 0:
+
+            # 同步模型
+            server.sync_policy_weights(model)
+
             test_format_reward, test_answer_reward = run_test(
                 server=server,
                 questions=raw_test_questions,
@@ -234,13 +267,20 @@ def main():
                 reward_fn=r1_zero_reward_fn if config["prompt_type"] == "r1_zero_three_shot" or config["prompt_type"] == "r1_zero" else question_only_reward_fn
             )
 
-            print(f"Step {i}: test_format_reward = {test_format_reward}, test_answer_reward = {test_answer_reward}")
+            writer.add_scalar("[test] format_reward", test_format_reward, step)
+            writer.add_scalar("[test] answer_reward", test_answer_reward, step)
+            print(f"Step {step}: test_format_reward = {test_format_reward}, test_answer_reward = {test_answer_reward}")
 
-        print(f"loss: {train_loss}")
-        print(f"format_reward: {(train_metadata["format_reward"])}")
+        writer.add_scalar("[train] loss", train_loss, step)
+        writer.add_scalar("[train] format_reward", train_metadata["format_reward"], step)
+        writer.add_scalar("[train] total_reward", train_metadata["total_reward"], step)
+        print(f"Step {step} Summary:", end=" ")
+        print(f"loss: {train_loss}", end=" ")
+        print(f"format_reward: {(train_metadata["format_reward"])}", end=" ")
         print(f"total_reward: {(train_metadata["total_reward"])}")
 
     server.stop()
+    writer.close()
 
 if __name__ == "__main__":
     main()

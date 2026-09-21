@@ -93,5 +93,4 @@ def main():
     plot_metrics(metrics, args.output_path)
 
 if __name__ == "__main__":
-    args = parse_args()
     main()
