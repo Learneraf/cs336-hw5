@@ -34,5 +34,13 @@ def aggregate_loss_across_microbatch(
         loss = (per_token_policy_gradient_loss * mask).sum(dim=1) / mask.sum(dim=1) # (batch_size,)
         loss = loss.mean() # scalar
         return loss
+    elif loss_normalization == "constant":
+        # The default value of normalization_constant is BGL, where B is the batchsize, G is groupsize and L is the maxlength of the whole batch.
+        if normalization_constant == None:
+            # The per_token_policy_gradient_loss.shape is (BG, L), where BG is named as rollout batchsize, batchsize as simplifed.
+            normalization_constant = per_token_policy_gradient_loss.size(0) * per_token_policy_gradient_loss.size(1)
+        loss = (per_token_policy_gradient_loss * mask).sum() # scalar
+        loss = loss / normalization_constant # scalar
+        return loss
     else:
         raise NotImplementedError(f"Unsupported loss_normalization option {loss_normalization}")

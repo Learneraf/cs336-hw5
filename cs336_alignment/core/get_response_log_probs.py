@@ -40,10 +40,11 @@ def get_response_log_probs(
     if return_token_entropy:
         # entropy 反应的是一种确定性的指标 
         # entropy = - p * log(p)
-        token_entropy = -torch.sum(
-            log_softmax.exp() * log_softmax,
-            dim=-1
-        )
+        with torch.no_grad():
+            token_entropy = -torch.sum(
+                log_softmax.exp() * log_softmax,
+                dim=-1
+            ) # (B, S)
         return {"log_probs": log_probs, "token_entropy": token_entropy}
     else:
         return {"log_probs": log_probs}

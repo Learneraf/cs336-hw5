@@ -41,6 +41,8 @@ def compute_group_normalized_rewards(
     if baseline == "mean":
         per_prompt_mean = torch.mean(rewards_reshaped, dim=1, keepdim=True) # (n_prompt, 1)
         raw_rewards = (rewards_reshaped - per_prompt_mean).view(-1) # (rollout_batch_size,)
+    elif baseline == "none":
+        pass
     else:
         raise NotImplementedError(f"Unsupported baseline option {baseline}")
     
@@ -48,6 +50,12 @@ def compute_group_normalized_rewards(
         per_prompt_std = torch.std(rewards_reshaped, dim=1, keepdim=True) # (n_prompt, 1)
         raw_rewards = raw_rewards.view(-1, group_size) # (n_prompt, group_size)
         raw_rewards = (raw_rewards / (per_prompt_std + advantage_eps)).view(-1) # (rollout_batch_size,)
+    elif advantage_normalizer == "mean":
+        per_prompt_mean = torch.mean(rewards_reshaped, dim=1, keepdim=True) # (n_prompt, 1)
+        raw_rewards = raw_rewards.view(-1, group_size) # (n_prompt, group_size)
+        raw_rewards = (raw_rewards / (per_prompt_mean + advantage_eps)).view(-1) # (rollout_batch_size,)
+    elif advantage_normalizer == "none":
+        pass
     else:
         raise NotImplementedError(f"Unsupported advantage_normalizer option {advantage_normalizer}")
 

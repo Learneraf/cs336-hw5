@@ -21,7 +21,7 @@ from cs336_alignment.utils import get_current_time
 logging.basicConfig(level=logging.ERROR)
 logger = logging.getLogger(__name__)
 
-writer = SummaryWriter(log_dir=f"../outputs/naive_grpo_gsm8k/{get_current_time()}", flush_secs=15)
+writer = SummaryWriter(log_dir=f"../outputs/maxrl_gsm8k/{get_current_time()}", flush_secs=15)
 
 def check_hyperparams(
     train_batch_size: int,
@@ -151,7 +151,7 @@ def run_test(
     return format_reward / len(questions), answer_reward / len(questions)
 
 def main():
-    config_path = "naive_grpo_configs.yaml"
+    config_path = "maxrl_configs.yaml"
     config = load_config(config_path)
 
     check_hyperparams(config["train_batch_size"], config["group_size"], config["n_train_examples"])
@@ -188,7 +188,7 @@ def main():
     server = VLLMServer(
         model_id=config["model"], 
         gpu=config["infer_device"], 
-        port=8001,
+        port=8004,
         seed=0,
         gpu_memory_utilization=config["gpu_memory_utilization"]
     )
@@ -246,9 +246,10 @@ def main():
             group_size=config["group_size"],
             baseline=config["baseline"],
             advantage_eps=config["advantage_eps"],
-            advantage_normalizer=config["advantage_normalizer"],
+            advantage_normalizer="mean",
             importance_reweighting_method=config["importance_reweighting_method"],
-            loss_normalization="sequence",
+            loss_normalization="constant",
+            normalization_constant=config["train_batch_size"] * max(len(x) for x in rollout_responses_texts),
             device=config["train_device"]
         )
 

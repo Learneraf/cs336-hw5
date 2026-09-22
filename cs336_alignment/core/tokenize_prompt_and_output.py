@@ -63,5 +63,5 @@ def tokenize_prompt_and_output(
     return {
         "input_ids": torch.stack([torch.tensor(tok) for tok in input_ids]),
         "labels": torch.stack([torch.tensor(tok) for tok in labels]),
-        "response_mask": torch.stack([torch.tensor(mask) for mask in response_mask])
+        "response_mask": torch.stack([torch.tensor(mask) for mask in response_mask]).bool()
     }

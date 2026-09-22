@@ -2,8 +2,6 @@ from typing import Literal, Callable
 import torch
 from transformers import PreTrainedTokenizerBase
 import logging
-from itertools import compress
-import math
 
 from .aggregate_loss_across_microbatch import aggregate_loss_across_microbatch
 from .compute_group_normalized_rewards import compute_group_normalized_rewards
@@ -103,82 +101,13 @@ def grpo_train_step(
                 Dict with metadata from the underlying loss call, gradient norm
                 before clipping, and any other statistics you might want to log.
     """
-    model = model.to(device)
-
-    return_loss = torch.tensor(0.0, device=device)
+    return_loss = 0.0
     total_reward = 0.0
     format_reward = 0.0
-
-    raw_rollout_batch_size = len(rollout_responses)
-    
-    raw_rewards, raw_rewards_metadata = compute_rollout_rewards(
-        reward_fn=reward_fn,
-        rollout_responses=rollout_responses,
-        repeated_ground_truths=repeated_ground_truths,
-        device=device
-    )
-
-    total_reward = raw_rewards_metadata["mean_total_reward"]
-    format_reward = raw_rewards_metadata["mean_format_reward"]
-
-    group_normalized_rewards, group_normalized_metadata = compute_group_normalized_rewards(
-        raw_rewards=raw_rewards,
-        group_size=group_size,
-        baseline=baseline,
-        advantage_eps=advantage_eps,
-        advantage_normalizer=advantage_normalizer
-    )
-
-    # To speed up training, we filter the groups who's group_normalized_rewards is zeros (for baseline is mean),
-    # and samples who's reward is zero (for baseline is none).
-    # We save the valid samples with the `active_masks` set to 1.
-    active_masks = []
-    if baseline == "mean":
-        # If the reward within group is the same, then skip the group.
-        for idx in range(0, raw_rollout_batch_size, group_size):
-            if any(group_normalized_rewards[idx:idx+group_size]):
-                active_masks.extend([1] * group_size)
-            else:
-                active_masks.extend([0] * group_size)
-    elif baseline == "none":
-        # If any reward is 0, then skip the data.
-        for idx in range(raw_rollout_batch_size):
-            if group_normalized_rewards[idx]:
-                active_masks.extend([1])
-            else:
-                active_masks.extend([0])
-
-    if not any(active_masks): # active_mask is zeros: [0, 0, 0, ..., 0]
-        metadata = {
-            "loss": torch.tensor(0.0, device=device),
-            "grad_norm": None,
-            "token_entropy": None,
-            "total_reward": total_reward,
-            "format_reward": format_reward
-        }
-        return return_loss, metadata
-    
-    active_masks_tensor = torch.tensor(active_masks, dtype=torch.bool, device=group_normalized_rewards.device)
-
-    # Filter the samples
-    repeated_prompts = list(compress(repeated_prompts, active_masks))
-    rollout_responses = list(compress(rollout_responses, active_masks))
-    repeated_ground_truths = list(compress(repeated_ground_truths, active_masks))
-
-    group_normalized_rewards = group_normalized_rewards[active_masks_tensor]
-    old_log_probs = old_log_probs[active_masks_tensor] if old_log_probs is not None else None
-
-
     rollout_batch_size = len(rollout_responses)
-
-    if baseline == "mean":
-        n_group = rollout_batch_size // group_size # 即 n_prompts_per_rollout_batch
-    elif baseline == "none":
-        n_group = torch.sum(active_masks_tensor).item()
-
-    gradient_accumulation_steps = math.ceil((gradient_accumulation_steps * rollout_batch_size) / raw_rollout_batch_size)
+    n_group = rollout_batch_size // group_size # 即n_prompts_per_rollout_batch
     
-    # 例如 train_batch_size 为 84， group_size 为 4，gradient_accumulation_steps 为 4
+    # 例如 train_batch_size 为 21， group_size 为 4，gradient_accumulation_steps 为 4
     # 则 n_group = 21， micro_n_group = 5, remainder = 1,
     # group_counts = [6, 5, 5, 5]
     # 意味着第一个 microbatch 取 6 组，第二个 microbatch 取 5 组，...，第八个 microbatch 取 0 组
@@ -191,7 +120,6 @@ def grpo_train_step(
         group_counts[i] += 1
 
     logger.debug(f"group_counts are {group_counts}")
-    
 
     prompt_and_output_result_dist = tokenize_prompt_and_output(
         prompt_strs=repeated_prompts,
@@ -201,26 +129,34 @@ def grpo_train_step(
     input_ids, labels, response_masks = prompt_and_output_result_dist["input_ids"], prompt_and_output_result_dist["labels"], prompt_and_output_result_dist["response_mask"]
 
     group_start_idx = 0
-    sum_entropies = torch.tensor(0.0, device=device)
-    sum_valid_tokens = torch.tensor(0.0, device=device)
     for gc in group_counts:
-        if baseline == "mean":
-            samples_in_microbatch = gc * group_size
-            samples_start_idx = group_start_idx * group_size
-        elif baseline == "none":
-            samples_in_microbatch = gc
-            samples_start_idx = group_start_idx
+        samples_in_microbatch = gc * group_size
+        samples_start_idx = group_start_idx * group_size
         samples_end_idx = samples_start_idx + samples_in_microbatch
 
         input_ids_microbatch = input_ids[samples_start_idx:samples_end_idx].to(device)
         rollout_response_microbatch = rollout_responses[samples_start_idx:samples_end_idx]
         labels_microbatch = labels[samples_start_idx:samples_end_idx].to(device)
-
+        repeated_ground_truths_microbatch = repeated_ground_truths[samples_start_idx:samples_end_idx]
         response_masks_microbatch = response_masks[samples_start_idx:samples_end_idx].to(device)
         old_logprob_microbatch = old_log_probs[samples_start_idx:samples_end_idx] if old_log_probs is not None else None
 
-        group_normalized_rewards_microbatch = group_normalized_rewards[samples_start_idx:samples_end_idx]
+        raw_rewards, raw_rewards_metadata = compute_rollout_rewards(
+            reward_fn=reward_fn,
+            rollout_responses=rollout_response_microbatch,
+            repeated_ground_truths=repeated_ground_truths_microbatch,
+            device=device
+        )
+        total_reward += raw_rewards_metadata["mean_total_reward"] * samples_in_microbatch
+        format_reward += raw_rewards_metadata["mean_format_reward"] * samples_in_microbatch
 
+        group_normalized_rewards, group_normalized_metadata = compute_group_normalized_rewards(
+            raw_rewards=raw_rewards,
+            group_size=group_size,
+            baseline=baseline,
+            advantage_eps=advantage_eps,
+            advantage_normalizer=advantage_normalizer
+        )
         response_log_probs_result_dict = get_response_log_probs(
             model=model,
             input_ids=input_ids_microbatch,
@@ -230,16 +166,11 @@ def grpo_train_step(
 
         if "token_entropy" in response_log_probs_result_dict:
             policy_log_probs, token_entropy = response_log_probs_result_dict["log_probs"], response_log_probs_result_dict["token_entropy"]
-            # token_entropy is of size (B, S)
         else:
             policy_log_probs, token_entropy = response_log_probs_result_dict["log_probs"], None
 
-        sum_entropies += torch.sum(token_entropy[response_masks_microbatch])
-        sum_valid_tokens += torch.sum(response_masks_microbatch)
-
-
         per_token_loss, per_token_loss_metadata = compute_policy_gradient_loss(
-            raw_rewards_or_advantages=group_normalized_rewards_microbatch,
+            raw_rewards_or_advantages=group_normalized_rewards,
             policy_log_probs=policy_log_probs,
             importance_reweighting_method=importance_reweighting_method,
             old_log_probs=old_logprob_microbatch,
@@ -254,12 +185,10 @@ def grpo_train_step(
             mask=response_masks_microbatch,
             loss_normalization=loss_normalization,
             normalization_constant=normalization_constant
-        ) 
-        if loss_normalization == "sequence":
-            loss *= len(rollout_response_microbatch) / raw_rollout_batch_size
+        ) * len(rollout_response_microbatch) / rollout_batch_size
 
         loss.backward()
-        return_loss += loss.detach()
+        return_loss += loss
 
         group_start_idx += gc
     
@@ -272,8 +201,8 @@ def grpo_train_step(
     metadata = {
         "loss": return_loss.item(),
         "grad_norm": grad_norm.item() if max_grad_norm is not None else None,
-        "token_entropy": (sum_entropies / sum_valid_tokens).item(),
-        "total_reward": total_reward,
-        "format_reward": format_reward
+        "token_entropy": token_entropy,
+        "total_reward": total_reward / rollout_batch_size,
+        "format_reward": format_reward / rollout_batch_size
     }
     return return_loss, metadata
